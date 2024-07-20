@@ -120,7 +120,7 @@ module.exports = (param) => {
                     // TODO fix /drop_toggle
                     {command: '/drop_toggle', description: 'Toggle /drop status. (Incomplete)'},
                     {
-                        command: '/reloginWX_2',
+                        command: '/relogin',
                         description: 'Immediately invalidate current WX login credential and reboot.'
                     },
 

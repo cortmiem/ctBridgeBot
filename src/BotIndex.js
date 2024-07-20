@@ -1143,7 +1143,7 @@ async function tgCommandHandler(tgMsg) {
         case "/reloginWX": {
             return await mod.tgProcessor.replyWithTips("aboutToReLoginWX", tgMsg.matched, 0);
         }
-        case "/reloginWX_2": {
+        case "/relogin": {
             tgBotDo.SendChatAction("typing", tgMsg.matched).then(tgBotDo.empty);
             await fs.promises.unlink("data/ctbridgebot.memory-card.json");
             ctLogger.warn("Re-login request invoked by user, memory-card deletion successful, attempting reboot!");

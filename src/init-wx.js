@@ -29,6 +29,7 @@ module.exports = (tgBotDo, wxLogger) => {
             'https://api.qrserver.com/v1/create-qr-code/?data=',
             encodeURIComponent(qrcode),
         ].join('');
+        console.log(status);
         if (status === 2) {
             qrcodeTerminal.generate(qrcode, {small: true}); // show QRcode in terminal
             console.log(qrcodeImageUrl);
