@@ -218,7 +218,8 @@ function filterMsgText(inText, args = {}) {
                 // ####################let regex = new RegExp(key, 'g');
                 const val = nativeEmojiMap[key][0]
                 txt = txt.replaceAll(key, val);
-                defLogger.trace(`[Verbose] replaced '${key}' to '${val}' in WX message.`);
+                // This logging below causes many useless logs in logfile! removing.
+                // defLogger.trace(`[Verbose] replaced '${key}' to '${val}' in WX message.`);
             }
             console.timeEnd(timerLabel);
         }
@@ -239,6 +240,7 @@ function filterMsgText(inText, args = {}) {
         if (args.peerName && !args.isGroup) {
             // P2P chat, not group, applying quote replacement
             const sets = secret.c11n.quotedMsgSuffixLineInPersonChat;
+            if (secret.misc.debug_show_additional_log) defLogger.trace(`#23382 Quoted message name debug: ${match[1]} / ${state.s.selfName} / ${args.peerName}`);
             if (match[1] === state.s.selfName) match[1] = sets ? sets[0] : match[1];
             if (match[1] === args.peerName) match[1] = sets ? sets[0] : match[1];
         }
