@@ -18,7 +18,7 @@ const state = {
         msgDropState: 0,
         syncSelfState: 0,
         targetLock: 0,
-        timerDataCount: 6,
+        timerData: [6, 3, 0, 0], // 0~1: fails countdown; 2~3: setInterval ID.
         msgMergeFailCount: 6,
         globalNetworkErrorCount: 3,
         wxStat: {
@@ -28,6 +28,10 @@ const state = {
             puppetDoneInitTime: 0
         },
         extra: 250,
+        keepalive: {
+            msgCounter_prev: 0,
+            idle_start_ts: 0,
+        }
     },
     last: {},
     s: { // session
@@ -84,6 +88,7 @@ const mod = {
     audioRecognition: require('./audioRecognition')(env),
     wxMddw: require('./wxMddw')(env),
     tgProcessor: require('./tgProcessor')(env),
+    keepalive: require('./m_keepalive')(env),
 }
 env.mod = mod;
 
@@ -200,7 +205,11 @@ async function onTGMsg(tgMsg) {
         if (tgMsg.sticker) {
             // We want to enable video_sticker.webm full support here, but almost all libraries require ffmpeg,
             // which is difficult to implement now. TODO webm conversion here
-            return await deliverTGToWx(tgMsg, tgMsg.sticker.thumbnail, "photo");
+            const timerLabel1 = (!secret.misc.debug_add_console_timers) ? "" : `Sticker delivery from tg to wx - Debug timer #${process.uptime().toFixed(2)}`;
+            if (timerLabel1) console.time(timerLabel1);
+            await deliverTGToWx(tgMsg, tgMsg.sticker.thumbnail, "photo");
+            if (timerLabel1) console.timeEnd(timerLabel1);
+            return true;
         }
         if (tgMsg.document) return await deliverTGToWx(tgMsg, tgMsg.document, "document");
         if (tgMsg.video) return await deliverTGToWx(tgMsg, tgMsg.video, "video");
@@ -464,8 +473,16 @@ async function onTGMsg(tgMsg) {
 
         }
     } catch (e) {
-        tgLogger.error(`{onTGMsg()}: ${e.message}`);
-        tgLogger.debug(`Stack: ${e.stack.split("\n").slice(0, 5).join("\n")}`);
+        const err = e.message;
+        // try matching with existing error cases, replace with user-friendly message
+        if (err.includes("uploadMedia err") && err.includes("reading 'name'")) {
+            tgLogger.error(`An internal error occurred when uploading your media from tg to wx. Please relogin and start a new session, or this function may remain unavailable.`);
+            // TODO notify_once(need_relogin_limited)
+        } else {
+            // not matching
+            tgLogger.error(`{onTGMsg()}: ${err}`);
+        }
+        tgLogger.debug(`[Stack] ${e.stack.split("\n").slice(0, 5).join("\n")}`);
     }
 
 }
@@ -495,7 +512,7 @@ async function onWxMessage(msg) {
         if (room) topic = await room.topic();
         let name = await contact.name();
         let alias = await contact.alias() || await contact.name(); // 发消息人备注
-        let dname = alias;  // Display Name, which will be overwritten with c2c.opts.nameType
+        let dname = alias; // [msg.dname]  // Display Name, which will be overwritten with c2c.opts.nameType
         let msgDef = {
             isSilent: false,
             forceMerge: false,
@@ -653,7 +670,7 @@ async function onWxMessage(msg) {
                     let filtered = false;
                     if (processor.isTimeValid(state.lastEmotion.ts, 18) && md5 === state.lastEmotion.md5) {
                         // Got duplicate and continuous Sticker, skipping and CONDEMN that!
-                        wxLogger.debug(`${contact} sent a duplicate emotion. Skipped and CONDEMN that !!!`);
+                        wxLogger.debug(`${contact} sent a duplicate emotion, Skipped.`);
                         filtered = true;
                     }
                     // Regardless match or not, update state.lastEmotion
@@ -777,7 +794,7 @@ async function onWxMessage(msg) {
                     wxLogger.warn(`Detected as Link, but error occurred while getting content.`);
                 }
             } else if (/(.*?):<br\/>\/cgi-bin\/mmwebwx-bin\/webwxgetpubliclinkimg\?url=xxx&msgid=([0-9]*?)&pictype=location/.test(content)) {
-                wxLogger.trace(`content matched pattern, recognised as Location.`);
+                wxLogger.debug(`content matched pattern, recognised as Location.`);
                 // Developer Comment: This is a location message,
                 // but it is not supported by WebWeChat-wechaty now, so cannot provide full support.
                 const res = content.match(/(.*?):<br\/>\/cgi-bin\/mmwebwx-bin\/webwxgetpubliclinkimg\?url=xxx&msgid=([0-9]*?)&pictype=location/);
@@ -786,46 +803,47 @@ async function onWxMessage(msg) {
                 msg.DType = DTypes.Text;
             } else {
                 // const result=await deliverWxToTG();
-                const FileRegex = new RegExp(/&lt;totallen&gt;(.*?)&lt;\/totallen&gt;/);
-                try {
-                    let regResult = FileRegex.exec(content);
-                    msg.filesize = parseInt(regResult[1]);
-                    msgDef.isSilent = false;
-                    content = `📎[${msg.payload.filename}], ${(msg.filesize / 1024 / 1024).toFixed(3)}MB.\n`;
-                    msg.toDownloadPath = (function () {   // File Local Path Generator
-                        const path1 = `./downloaded/file/`;
-                        const filename = msg.payload.filename;
-                        let rand = 0;
-                        if (!fs.existsSync(path1 + filename)) return path1 + filename;
-                        do {
-                            rand = (Math.random() * 122).toFixed();
-                        }
-                        while (fs.existsSync(path1 + `(${rand})` + filename));
-                        wxLogger.debug(`Renamed destination filename [${filename}] with factor ${rand} to avoid duplication.`);
-                        return path1 + `(${rand})` + filename;
-                    })();
-                    if (msg.filesize === 0) {
-                        wxLogger.warn(`Got a zero-size wx file here, no delivery would present and please check DT log manually.\nSender:{${alias}}, filename=(${msg.payload.filename})`);
-                        return;
-                    } else if (msg.filesize < 50) {
-                        // 小于50个字节的文件不应被下载，但是仍会提供下载方式：因为大概率是新的消息类型，
-                        // 比如块级链接和服务消息
-                        msg.autoDownload = false;
-                        msgDef.isSilent = true;
-                        content += `Too small, so it maybe not a valid file. Check DT log for detail.`
-                        wxLogger.info(`Got a very-small wx file here, please check manually. Sender:{${alias}`);
-                    } else if (msg.filesize < secret.misc.wxAutoDownloadSizeThreshold) {
-                        msg.autoDownload = true;
-                        content += `Trying download as size is smaller than threshold.`/*Remember to change the prompt in two locations!*/;
-                    } else {
-                        msg.autoDownload = false;
-                        content += `Send a single <code>OK</code> to retrieve that.`;
+                const FileRegex = new RegExp(/<totallen>(.*?)<\/totallen>/);
+                // tips: sometimes the content has '<'s rather than '&lt;'s, so replace them all to avoid errors
+                let regResult = FileRegex.exec(content.replaceAll("&lt;", "<").replaceAll("&gt;", ">"));
+                msg.filesize = parseInt(regResult[1]);
+                msgDef.isSilent = false;
+                content = `📎[${msg.payload.filename}], ${(msg.filesize / 1024 / 1024).toFixed(3)}MB.\n`;
+                msg.toDownloadPath = (function () {   // File Local Path Generator
+                    const path1 = `./downloaded/file/`;
+                    const filename = msg.payload.filename;
+                    let rand = 0;
+                    if (!fs.existsSync(path1 + filename)) return path1 + filename;
+                    do {
+                        rand = (Math.random() * 122).toFixed();
                     }
-                    msg.DType = DTypes.File;
-                } catch
-                  (e) {
-                    wxLogger.debug(`Detected as File, but error occurred while getting filesize.`);
+                    while (fs.existsSync(path1 + `(${rand})` + filename));
+                    wxLogger.debug(`Renamed destination filename [${filename}] with factor ${rand} to avoid duplication.`);
+                    return path1 + `(${rand})` + filename;
+                })();
+                if (msg.filesize === 0) {
+                    wxLogger.warn(`Got a zero-size wx file here, no delivery would present and please check DT log manually.\nSender:{${alias}}, filename=(${msg.payload.filename})`);
+                    return;
+                } else if (msg.filesize < 50) {
+                    // 小于50个字节的文件不应被下载，但是仍会提供下载方式：因为大概率是新的消息类型，
+                    // 比如块级链接和服务消息
+                    msg.autoDownload = false;
+                    msgDef.isSilent = true;
+                    content += `Too small, so it maybe not a valid file. Check DT log for detail.`
+                    wxLogger.info(`Got a very-small wx file here, please check manually. Sender:{${alias}}, filename=(${msg.payload.filename})`);
+                } else if (msg.filesize < secret.misc.wxAutoDownloadSizeThreshold) {
+                    msg.autoDownload = true;
+                    content += `Trying download as size is smaller than threshold.`/*Remember to change the prompt in two locations!*/;
+                } else {
+                    msg.autoDownload = false;
+                    content += `Send a single <code>OK</code> to retrieve that.`;
                 }
+                msg.DType = DTypes.File;
+                // } catch
+                //   (e) {
+                //     wxLogger.debug(`Detected as File, but error occurred while getting filesize.`);
+                // }
+                // Remove error handling function here to let them go to upper level.
             }
         }
 
@@ -908,13 +926,13 @@ async function onWxMessage(msg) {
                     msgDef.isSilent = true;
                     msgDef.forceMerge = true;
                     // Force override {name} to let system message seems better
-                    dname = titles.systemMsgTitleInRoom;
+                    msg.dname = titles.systemMsgTitleInRoom;
                 }
 
                 try {
                     if (mod.tgProcessor.isPreRoomValid(state.preRoom, topic, msgDef.forceMerge, secret.misc.mergeResetTimeout.forGroup)) {
                         const isText = msg.DType === DTypes.Text;
-                        const result = await mod.tgProcessor.mergeToPrev_tgMsg(msg, true, content, name, dname, isText);
+                        const result = await mod.tgProcessor.mergeToPrev_tgMsg(msg, true, content, name, isText);
                         if (result === true) {
                             // Let's continue on 'onceMergeCapacity'
                             with (state.preRoom) {
@@ -959,7 +977,7 @@ async function onWxMessage(msg) {
                     const lastDate = (_.tgMsg) ? (_.tgMsg.edit_date || _.tgMsg.date) : 0;
                     const nowDate = dayjs().unix();
                     if ((_.name === name || _.name === alias) && nowDate - lastDate < secret.misc.mergeResetTimeout.forPerson) {
-                        const result = await mod.tgProcessor.mergeToPrev_tgMsg(msg, false, content, name, dname, msg.DType === DTypes.Text);
+                        const result = await mod.tgProcessor.mergeToPrev_tgMsg(msg, false, content, name, msg.DType === DTypes.Text);
                         if (result === true) return;
                     } else
                         msg.prePersonNeedUpdate = true;
@@ -974,11 +992,10 @@ async function onWxMessage(msg) {
 
             // if (haveLock) talkerLocks.pop();
         }
-    } catch
-      (e) {
-        tgLogger.error(`{onWxMsg()}: ${e.message}`);
-        tgLogger.debug(`Stack: ${e.stack.split("\n").slice(0, 5).join("\n")}\nSee log file for detail.`);
-        tgLogger.trace(`wxMsg: ${JSON.stringify(msg)}`);
+    } catch (e) {
+        wxLogger.error(`{onWxMsg()}: ${e.message}`);
+        wxLogger.debug(`[Stack] ${e.stack.split("\n").slice(0, 5).join("\n")}\nSee log file for detail.`);
+        wxLogger.trace(`[wxMsg] ${JSON.stringify(msg)}`);
     }
 }
 
@@ -1347,7 +1364,6 @@ async function softReboot(reason) {
             "messageCount": 0,
         },
     };
-    state.v.timerDataCount = 6;
     state.v.msgMergeFailCount = 6;
     state.v.globalNetworkErrorCount = 3;
 
@@ -1433,14 +1449,22 @@ async function deliverTGToWx(tgMsg, tg_media, media_type) {
     let file_path = './downloaded/' + (
       (tgMsg.photo) ? (`photoTG/${tgMsg.photo[tgMsg.photo.length - 1].file_unique_id}.png`) :
         (tgMsg.document ? (`fileTG/${tg_media.file_name}`) :
-          (tgMsg.sticker ? (`stickerTG/${tg_media.file_id}.webp`) :
+          (tgMsg.sticker ? (`stickerTG/${tg_media.file_unique_id}.webp`) :  // Hope this could reduce duplicate sticker download
             (`videoTG/${tg_media.file_unique_id}.mp4`))));
+    // file_path = `"${file_path}"`;
     const action = `upload_${media_type}`;
     tgBotDo.SendChatAction(action, receiver).then(tgBotDo.empty)
     tgLogger.trace(`file_path is ${file_path}.`);
     // if sticker.webp exist, skip download
     if (fs.existsSync(file_path) && tgMsg.sticker) {
         // sticker file exist, do nothing
+        if ((await fs.promises.stat(file_path)).size === 0) {
+            // This file is corrupt, re-download it.
+            await fs.promises.unlink(file_path);
+            // TODO add empty file check to all categories; explore if TG offer filename specification in API
+            await downloader.httpsWithProxy(secret.bundle.getTGFileURL(fileCloudPath), file_path);
+        } else
+            conLogger.trace(`sticker file exist (${file_path}), no need to download this time.`)
     } else await downloader.httpsWithProxy(secret.bundle.getTGFileURL(fileCloudPath), file_path);
     let packed = null;
     if (tgMsg.sticker) {
@@ -1457,7 +1481,8 @@ async function deliverTGToWx(tgMsg, tg_media, media_type) {
                 packed = await FileBox.fromBuffer(buffer, `T_sticker_${tgMsg.sticker.file_unique_id}.gif`);
             }
         } catch (e) {
-            if (srv_type === 2) ctLogger.debug(`Failed to use 'sharp' to convert tg sticker to jpg.\n\t${e.toString()}\n\tSwitching to upyun middleware instead.`);
+            if (srv_type === 2) ctLogger.info(`Failed to use 'sharp' to convert tg sticker to jpg.\n\t${e.toString()}\n\tFalling back to upyun middleware instead. (See logfile for detail)`);
+            ctLogger.trace(`${e.stack.split("\n").slice(0, 5).join("\n")}`)
             if (secret.upyun.switch !== "on") {
                 tgLogger.warn(`TG sticker pre-process interrupted as 'sharp' failed and upyun not enabled. Message not delivered.`);
                 await mod.tgProcessor.replyWithTips("notEnabledInConfig", tgMsg.matched);
@@ -1662,11 +1687,20 @@ wxbot.start()
   .then(() => {
       state.v.wxStat.puppetDoneInitTime = process.uptime();
       wxLogger.info(`开始登录微信...\t\tpuppetDoneInitTime: ${state.v.wxStat.puppetDoneInitTime.toFixed(2)} s`);
-  }).catch((e) => wxLogger.error(e));
+  }).catch((e) => {
+    const conf1 = secret.misc.auto_reboot_after_error_detected;
+    if (e.toString().includes("Page crashed") && conf1) {
+        wxLogger.error(msg + `\n[auto reboot after errors] = ${conf1}; Reboot procedure initiated...\n\n\n\n`);
+        setTimeout(() => {
+            process.exit(1);
+        }, 5000);
+    } else
+        wxLogger.error(e);
+});
 
 require('./common')("startup");
 
-async function timerFunc() {
+async function timerFunction_fast() {
     try {
         // Handle state.poolToDelete
         for (const itemId in state.poolToDelete) {
@@ -1688,14 +1722,44 @@ async function timerFunc() {
             }
         }
     } catch (e) {
-        ctLogger.info(`An exception happened within timer function with x${state.v.timerDataCount} reset cycles left:\n\t${e.toString()}`);
-        state.v.timerDataCount--;
-        if (state.v.timerDataCount < 0) clearInterval(timerData);
+        ctLogger.info(`An exception happened within the fast timer function: ${e.toString()}`);
+        state.v.timerData[0]--;
+        if (state.v.timerData[0] < 0) {
+            ctLogger.error(`Due to frequent errors in the fast timer function, it has been disabled. Check and reboot to restore it.`)
+            ctLogger.debug(`Stack: ${e.stack.split("\n").slice(0, 5).join("\n")}`);
+            clearInterval(state.v.timerData[2]);
+        }
+    }
+}
+
+async function timerFunction_slow() {
+    try {
+        // 'keepalive' check
+        if (secret.mods.keepalive.switch === "on") await mod.keepalive.triggerCheck();
+        // Scheduled restart
+        for (const i of secret.misc.scheduled_reboot) {
+            if (dayjs().hour() === i.hour) {
+                // reboot initiated
+                ctLogger.info(`Scheduled reboot at ${i.hour} o'clock. Rebooting in 30s...`);
+                setTimeout(() => {
+                    process.exit(1);
+                }, 29000);
+            }
+        }
+    } catch (e) {
+        ctLogger.info(`An exception happened within the slow timer function: ${e.toString()}`);
+        state.v.timerData[1]--;
+        if (state.v.timerData[1] < 0) {
+            ctLogger.error(`Due to frequent errors in the slow timer function, it has been disabled. Check and reboot to restore it.`)
+            ctLogger.debug(`Stack: ${e.stack.split("\n").slice(0, 5).join("\n")}`);
+            clearInterval(state.v.timerData[3]);
+        }
     }
 }
 
 // General Timer Function
-setInterval(timerFunc, 5000);
+state.v.timerData[2] = setInterval(timerFunction_fast, 5000);
+state.v.timerData[3] = setInterval(timerFunction_slow, 10 * 60 * 1000);
 
 setInterval(() => {
     const str = `Uptime: ${(process.uptime() / 3600).toFixed(2)}hrs | wxMsgTotal: ${state.v.wxStat.MsgTotal}\n`;
